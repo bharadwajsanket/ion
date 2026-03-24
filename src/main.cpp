@@ -2,264 +2,331 @@
 #include <string>
 #include <filesystem>
 #include <fstream>
-#include <ctime>
+#include <vector>
+#include <sstream>
+#include <unordered_map>
 
 namespace fs = std::filesystem;
 
 // =======================
-// Helpers
+// FILE HELPERS
 // =======================
 
-bool is_valid_repo(const fs::path& repo_path) {
-    return fs::exists(repo_path / "HEAD") &&
-           fs::exists(repo_path / "commits") &&
-           fs::exists(repo_path / "objects");
-}
-
-std::string read_head() {
-    std::ifstream head(".ion/HEAD");
+std::string read_file(const std::string& path) {
+    std::ifstream in(path);
     std::string value;
-    std::getline(head, value);
+    std::getline(in, value);
     return value;
 }
 
-void write_head(const std::string& id) {
-    std::ofstream head(".ion/HEAD", std::ios::trunc);
-    head << id;
+void write_file(const std::string& path, const std::string& value) {
+    fs::create_directories(fs::path(path).parent_path());
+    std::ofstream out(path, std::ios::trunc);
+    out << value;
 }
 
 // =======================
-// Safety
+// REPO CHECK
 // =======================
 
-bool confirm_action(const std::string& message) {
-    std::cout << message << "\nType 'yes' to continue: ";
-    std::string input;
-    std::getline(std::cin, input);
-    return input == "yes";
+bool is_valid_repo() {
+    return fs::exists(".ion/HEAD") &&
+           fs::exists(".ion/branches") &&
+           fs::exists(".ion/commits") &&
+           fs::exists(".ion/objects/files");
 }
 
 // =======================
-// File Operations
+// BRANCH HELPERS
 // =======================
 
-// Copy directory excluding .ion and build artifacts
-void copy_directory(const fs::path& source, const fs::path& destination) {
-    for (const auto& entry : fs::recursive_directory_iterator(source)) {
+std::string get_current_branch() {
+    return read_file(".ion/HEAD");
+}
 
-        fs::path relative = fs::relative(entry.path(), source);
-        std::string rel = relative.string();
+std::string get_branch_commit(const std::string& branch) {
+    return read_file(".ion/branches/" + branch);
+}
 
-        if (rel.rfind(".ion", 0) == 0) continue;
-        if (rel == "ion") continue;
-        if (rel.size() >= 2 && rel.substr(rel.size() - 2) == ".o") continue;
-        if (rel.size() >= 4 && rel.substr(rel.size() - 4) == ".out") continue;
+void set_branch_commit(const std::string& branch, const std::string& commit) {
+    write_file(".ion/branches/" + branch, commit);
+}
 
-        fs::path target = destination / relative;
+// =======================
+// HASH
+// =======================
 
-        if (fs::is_directory(entry.path())) {
-            fs::create_directories(target);
+std::string hash_file(const fs::path& file) {
+    std::ifstream in(file, std::ios::binary);
+    std::ostringstream buffer;
+    buffer << in.rdbuf();
+    return std::to_string(std::hash<std::string>{}(buffer.str()));
+}
+
+// =======================
+// IGNORE
+// =======================
+
+bool should_ignore(const std::string& rel) {
+    if (rel.rfind(".ion", 0) == 0) return true;
+    return false;
+}
+
+// =======================
+// COMMIT READ
+// =======================
+
+std::unordered_map<std::string, std::string> read_commit_map(const std::string& id) {
+
+    std::unordered_map<std::string, std::string> map;
+
+    if (id == "null") return map;
+
+    std::ifstream in(".ion/commits/" + id);
+    std::string line;
+
+    bool reading = false;
+
+    while (std::getline(in, line)) {
+
+        if (line == "files:") {
+            reading = true;
+            continue;
         }
-        else if (fs::is_regular_file(entry.path())) {
-            fs::create_directories(target.parent_path());
-            fs::copy_file(entry.path(), target, fs::copy_options::overwrite_existing);
+
+        if (reading) {
+            std::istringstream iss(line);
+            std::string file, hash;
+            iss >> file >> hash;
+            map[file] = hash;
         }
     }
+
+    return map;
 }
 
-// Clean working directory except .ion
-void clean_working_directory() {
-    for (const auto& entry : fs::directory_iterator(".")) {
+// =======================
+// RESTORE
+// =======================
 
-        std::string name = entry.path().filename().string();
+void restore_commit(const std::string& id) {
 
-        if (name == ".ion") continue;
-
+    for (auto& entry : fs::directory_iterator(".")) {
+        if (entry.path().filename() == ".ion") continue;
         fs::remove_all(entry.path());
     }
+
+    if (id == "null") return;
+
+    std::ifstream in(".ion/commits/" + id);
+    std::string line;
+    bool reading = false;
+
+    while (std::getline(in, line)) {
+
+        if (line == "files:") {
+            reading = true;
+            continue;
+        }
+
+        if (reading) {
+            std::istringstream iss(line);
+            std::string file, hash;
+            iss >> file >> hash;
+
+            fs::path src = ".ion/objects/files/" + hash;
+            fs::path dst = file;
+
+            fs::create_directories(dst.parent_path());
+            fs::copy_file(src, dst);
+        }
+    }
 }
 
 // =======================
-// Commands
+// INIT
 // =======================
 
 int cmd_init() {
-    fs::path repo = ".ion";
-    fs::path temp_repo = ".ion.tmp";
 
-    if (fs::exists(repo)) {
-        if (is_valid_repo(repo)) {
-            std::cout << "Repository already initialized.\n";
-            return 0;
-        } else {
-            std::cerr << "Error: Invalid or corrupted repository.\n";
-            return 1;
-        }
-    }
-
-    try {
-        if (fs::exists(temp_repo)) {
-            fs::remove_all(temp_repo);
-        }
-
-        fs::create_directory(temp_repo);
-        fs::create_directory(temp_repo / "commits");
-        fs::create_directory(temp_repo / "objects");
-
-        std::ofstream head(temp_repo / "HEAD");
-        head << "null";
-        head.close();
-
-        fs::rename(temp_repo, repo);
-
-        std::cout << "Initialized empty ion repository.\n";
+    if (fs::exists(".ion")) {
+        std::cout << "Repository already exists\n";
         return 0;
     }
-    catch (...) {
-        std::cerr << "Error: Failed to initialize repository.\n";
 
-        if (fs::exists(temp_repo)) {
-            fs::remove_all(temp_repo);
-        }
+    fs::create_directory(".ion");
+    fs::create_directory(".ion/commits");
+    fs::create_directories(".ion/objects/files");
+    fs::create_directory(".ion/branches");
 
-        return 1;
-    }
+    write_file(".ion/HEAD", "main");
+    write_file(".ion/branches/main", "null");
+
+    std::cout << "Initialized ion repository\n";
+    return 0;
 }
+
+// =======================
+// SAVE (BRANCH-AWARE)
+// =======================
 
 int cmd_save(const std::string& message) {
 
-    fs::path repo = ".ion";
-
-    if (!fs::exists(repo) || !is_valid_repo(repo)) {
-        std::cerr << "Error: Not an ion repository.\n";
+    if (!is_valid_repo()) {
+        std::cerr << "Not an ion repository\n";
         return 1;
     }
 
-    std::string head = read_head();
+    std::string branch = get_current_branch();
+    std::string parent = get_branch_commit(branch);
 
-    int new_id = 1;
-    std::string parent = "null";
+    int new_id = (parent == "null") ? 1 : std::stoi(parent) + 1;
+    std::string id = std::to_string(new_id);
 
-    if (head != "null") {
-        new_id = std::stoi(head) + 1;
-        parent = head;
+    std::vector<std::pair<std::string, std::string>> file_map;
+
+    for (const auto& entry : fs::recursive_directory_iterator(".")) {
+
+        if (!fs::is_regular_file(entry.path())) continue;
+
+        std::string rel = fs::relative(entry.path(), ".").string();
+
+        if (should_ignore(rel)) continue;
+
+        std::string hash = hash_file(entry.path());
+        fs::path obj = ".ion/objects/files/" + hash;
+
+        if (!fs::exists(obj)) {
+            fs::create_directories(obj.parent_path());
+            fs::copy_file(entry.path(), obj);
+        }
+
+        file_map.push_back({rel, hash});
     }
 
-    std::string id_str = std::to_string(new_id);
-
-    fs::path object_path = repo / "objects" / id_str;
-    fs::create_directories(object_path);
-
-    copy_directory(".", object_path);
-
-    fs::path commit_file = repo / "commits" / id_str;
-
-    std::ofstream commit(commit_file);
-    commit << "id: " << id_str << "\n";
+    std::ofstream commit(".ion/commits/" + id);
+    commit << "id: " << id << "\n";
     commit << "parent: " << parent << "\n";
     commit << "message: " << message << "\n";
     commit << "timestamp: " << std::time(nullptr) << "\n";
-    commit.close();
+    commit << "files:\n";
 
-    write_head(id_str);
+    for (auto& [f, h] : file_map) {
+        commit << f << " " << h << "\n";
+    }
 
-    std::cout << "Saved snapshot " << id_str << "\n";
+    set_branch_commit(branch, id);
+
+    std::cout << "Saved snapshot " << id << " on branch " << branch << "\n";
+    return 0;
+}
+
+// =======================
+// BRANCH
+// =======================
+
+int cmd_branch(const std::string& name) {
+
+    fs::create_directories(".ion/branches");
+
+    fs::path path = ".ion/branches/" + name;
+
+    if (fs::exists(path)) {
+        std::cerr << "Branch already exists\n";
+        return 1;
+    }
+
+    std::string current = get_current_branch();
+    std::string commit = get_branch_commit(current);
+
+    write_file(path.string(), commit);
+
+    std::cout << "Created branch " << name << "\n";
+    return 0;
+}
+
+// =======================
+// BRANCH LIST
+// =======================
+
+int cmd_branches() {
+
+    std::string current = get_current_branch();
+
+    for (auto& entry : fs::directory_iterator(".ion/branches")) {
+
+        std::string name = entry.path().filename();
+
+        if (name == current) {
+            std::cout << "* " << name << "\n";
+        } else {
+            std::cout << "  " << name << "\n";
+        }
+    }
 
     return 0;
 }
 
-int cmd_history() {
+// =======================
+// CHECKOUT
+// =======================
 
-    fs::path repo = ".ion";
+int cmd_checkout(const std::string& name) {
 
-    if (!fs::exists(repo) || !is_valid_repo(repo)) {
-        std::cerr << "Error: Not an ion repository.\n";
+    fs::path path = ".ion/branches/" + name;
+
+    if (!fs::exists(path)) {
+        std::cerr << "Branch not found\n";
         return 1;
     }
 
-    std::string current = read_head();
+    std::string commit = read_file(path.string());
+
+    restore_commit(commit);
+    write_file(".ion/HEAD", name);
+
+    std::cout << "Switched to branch " << name << "\n";
+    return 0;
+}
+
+// =======================
+// HISTORY (PER BRANCH)
+// =======================
+
+int cmd_history() {
+
+    std::string branch = get_current_branch();
+    std::string current = get_branch_commit(branch);
 
     if (current == "null") {
-        std::cout << "No commits yet.\n";
+        std::cout << "No commits yet\n";
         return 0;
     }
 
     while (current != "null") {
-        fs::path commit_file = repo / "commits" / current;
 
-        std::ifstream in(commit_file);
-        std::string line, message, parent;
+        std::ifstream in(".ion/commits/" + current);
+        std::string line;
+
+        std::string message;
+        std::string parent;
 
         while (std::getline(in, line)) {
-            if (line.rfind("message:", 0) == 0)
+            if (line.rfind("message:", 0) == 0) {
                 message = line.substr(9);
-            if (line.rfind("parent:", 0) == 0)
+            }
+            if (line.rfind("parent:", 0) == 0) {
                 parent = line.substr(8);
+            }
         }
 
-        std::cout << "Commit " << current << "\n";
-        std::cout << "Message:" << message << "\n\n";
+        std::cout << "commit " << current << "\n";
+        std::cout << "    " << message << "\n\n";
 
         current = parent;
     }
 
     return 0;
-}
-
-int cmd_restore(const std::string& id) {
-
-    fs::path repo = ".ion";
-    fs::path object_path = repo / "objects" / id;
-
-    if (!fs::exists(repo) || !is_valid_repo(repo)) {
-        std::cerr << "Error: Not an ion repository.\n";
-        return 1;
-    }
-
-    if (!fs::exists(object_path)) {
-        std::cerr << "Error: Commit not found.\n";
-        return 1;
-    }
-
-    if (!confirm_action("Warning: This will overwrite current files.")) {
-        std::cout << "Restore cancelled.\n";
-        return 0;
-    }
-
-    clean_working_directory();
-
-    for (const auto& entry : fs::recursive_directory_iterator(object_path)) {
-
-        fs::path relative = fs::relative(entry.path(), object_path);
-        fs::path target = "." / relative;
-
-        if (fs::is_directory(entry.path())) {
-            fs::create_directories(target);
-        }
-        else if (fs::is_regular_file(entry.path())) {
-            fs::create_directories(target.parent_path());
-            fs::copy_file(entry.path(), target, fs::copy_options::overwrite_existing);
-        }
-    }
-
-    write_head(id);
-
-    std::cout << "Restored to snapshot " << id << "\n";
-
-    return 0;
-}
-
-// =======================
-// Usage
-// =======================
-
-void print_usage() {
-    std::cout << "Usage: ion <command>\n";
-    std::cout << "Commands:\n";
-    std::cout << "  init\n";
-    std::cout << "  save <message>\n";
-    std::cout << "  history\n";
-    std::cout << "  restore <id>\n";
 }
 
 // =======================
@@ -269,34 +336,26 @@ void print_usage() {
 int main(int argc, char* argv[]) {
 
     if (argc < 2) {
-        print_usage();
+        std::cout << "Usage: ion <command>\n";
         return 1;
     }
 
-    std::string command = argv[1];
+    std::string cmd = argv[1];
 
-    if (command == "init") return cmd_init();
+    if (cmd == "init") return cmd_init();
 
-    else if (command == "save") {
-        if (argc < 3) {
-            std::cerr << "Error: Missing message\n";
-            return 1;
-        }
-        return cmd_save(argv[2]);
-    }
+    else if (cmd == "save") return cmd_save(argv[2]);
 
-    else if (command == "history") return cmd_history();
+    else if (cmd == "branch") return cmd_branch(argv[2]);
 
-    else if (command == "restore") {
-        if (argc < 3) {
-            std::cerr << "Error: Missing id\n";
-            return 1;
-        }
-        return cmd_restore(argv[2]);
-    }
+    else if (cmd == "branches") return cmd_branches();
+
+    else if (cmd == "checkout") return cmd_checkout(argv[2]);
+
+    else if (cmd == "history") return cmd_history();
 
     else {
-        std::cerr << "Error: Unknown command\n";
+        std::cerr << "Unknown command\n";
         return 1;
     }
 }
