@@ -1,10 +1,9 @@
-name: Build ion (multi-platform)
+name: Build & Release ion
 
 on:
   push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
+    tags:
+      - 'v*'   # triggers on version tags like v0.2
   workflow_dispatch:
 
 jobs:
@@ -32,26 +31,43 @@ jobs:
         if: matrix.os == 'windows-latest'
         uses: ilammy/msvc-dev-cmd@v1
 
-      - name: Build ion (Unix)
+      - name: Build (Unix)
         if: matrix.os != 'windows-latest'
-        run: |
-          g++ -std=c++17 src/main.cpp -o ion
+        run: g++ -std=c++17 src/main.cpp -o ion
 
-      - name: Build ion (Windows)
+      - name: Build (Windows)
         if: matrix.os == 'windows-latest'
-        run: |
-          cl /std:c++17 src\main.cpp /Fe:ion.exe
+        run: cl /std:c++17 src\main.cpp /Fe:ion.exe
 
-      - name: Upload binary (Unix)
-        if: matrix.os != 'windows-latest'
+      - name: Rename binaries
+        run: |
+          if [ "${{ matrix.os }}" = "macos-latest" ]; then mv ion ion-mac; fi
+          if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then mv ion ion-linux; fi
+        shell: bash
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ion-${{ matrix.os }}
-          path: ion
+          name: build-${{ matrix.os }}
+          path: |
+            ion-mac
+            ion-linux
+            ion.exe
 
-      - name: Upload binary (Windows)
-        if: matrix.os == 'windows-latest'
-        uses: actions/upload-artifact@v4
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
         with:
-          name: ion-windows
-          path: ion.exe
+          files: |
+            **/ion-mac
+            **/ion-linux
+            **/ion.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
