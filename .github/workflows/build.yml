@@ -3,7 +3,7 @@ name: Build & Release ion
 on:
   push:
     tags:
-      - 'v*'   # triggers on version tags like v0.2
+      - 'v*'
   workflow_dispatch:
 
 jobs:
@@ -40,10 +40,10 @@ jobs:
         run: cl /std:c++17 src\main.cpp /Fe:ion.exe
 
       - name: Rename binaries
+        shell: bash
         run: |
           if [ "${{ matrix.os }}" = "macos-latest" ]; then mv ion ion-mac; fi
           if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then mv ion ion-linux; fi
-        shell: bash
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -62,12 +62,15 @@ jobs:
       - name: Download artifacts
         uses: actions/download-artifact@v4
 
+      - name: Debug files
+        run: ls -R
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            **/ion-mac
-            **/ion-linux
-            **/ion.exe
+            */ion-mac
+            */ion-linux
+            */ion.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
