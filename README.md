@@ -2,7 +2,7 @@
 
 > A simple, local-first version control system.
 
-**Version:** v0.2 &nbsp;|&nbsp; C++17 &nbsp;|&nbsp; No dependencies &nbsp;|&nbsp; MIT License
+**Version:** v0.3.2 &nbsp;|&nbsp; C++17 &nbsp;|&nbsp; No dependencies &nbsp;|&nbsp; MIT License
 
 ---
 
@@ -11,11 +11,6 @@ ion is built for developers who want version control that is **predictable, read
 No staging area. No index. No detached HEAD. You save a snapshot, you get it back.
 
 ---
-
-## Install
-
-```bash
-curl -sSL https://raw.githubusercontent.com/bharadwajsanket/ion/main/install.sh | bash
 
 ## Why not Git?
 
@@ -42,21 +37,21 @@ If Git sometimes feels like too much, ion is a focused alternative that stays si
 
 ---
 
-## Installation
+## Install
 
 ### Quick Install (macOS / Linux)
+
+```bash
+curl -sSL https://raw.githubusercontent.com/bharadwajsanket/ion/main/install.sh | bash
+```
+
+### Manual Build
 
 ```bash
 git clone https://github.com/bharadwajsanket/ion.git
 cd ion
 g++ -std=c++17 -o ion src/main.cpp
 sudo mv ion /usr/local/bin/ion
-```
-
-### Manual Build
-
-```bash
-g++ -std=c++17 -o ion src/main.cpp
 ```
 
 Requires any C++17-compliant compiler (GCC 8+, Clang 7+). No external libraries needed.
