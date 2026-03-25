@@ -12,6 +12,14 @@ No staging area. No index. No detached HEAD. You save a snapshot, you get it bac
 
 ---
 
+## Why I built this
+
+I wanted to understand how version control systems work internally without the complexity of Git.
+
+ion is a learning-first system that focuses on clarity over features.
+
+---
+
 ## Why not Git?
 
 ion is not trying to replace Git.
