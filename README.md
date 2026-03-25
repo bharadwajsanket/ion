@@ -42,7 +42,7 @@ If Git sometimes feels like too much, ion is a focused alternative that stays si
 ### Quick Install (macOS / Linux)
 
 ```bash
-git clone https://github.com/your-username/ion.git
+git clone https://github.com/bharadwajsanket/ion.git
 cd ion
 g++ -std=c++17 -o ion src/main.cpp
 sudo mv ion /usr/local/bin/ion
