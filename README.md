@@ -12,6 +12,11 @@ No staging area. No index. No detached HEAD. You save a snapshot, you get it bac
 
 ---
 
+## Install
+
+```bash
+curl -sSL https://raw.githubusercontent.com/bharadwajsanket/ion/main/install.sh | bash
+
 ## Why not Git?
 
 ion is not trying to replace Git.
