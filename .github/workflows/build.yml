@@ -6,6 +6,9 @@ on:
       - 'v*'
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     name: Build on ${{ matrix.os }}
@@ -19,19 +22,27 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Set up compiler (Linux)
+      # ========================
+      # Install compilers
+      # ========================
+
+      - name: Setup compiler (Linux)
         if: matrix.os == 'ubuntu-latest'
         run: sudo apt-get update && sudo apt-get install -y g++
 
-      - name: Set up compiler (Mac)
+      - name: Setup compiler (Mac)
         if: matrix.os == 'macos-latest'
         run: brew install gcc || true
 
-      - name: Set up compiler (Windows)
+      - name: Setup compiler (Windows)
         if: matrix.os == 'windows-latest'
         uses: ilammy/msvc-dev-cmd@v1
 
-      - name: Build (Unix)
+      # ========================
+      # Build binaries
+      # ========================
+
+      - name: Build (Linux/macOS)
         if: matrix.os != 'windows-latest'
         run: g++ -std=c++17 src/main.cpp -o ion
 
@@ -39,11 +50,19 @@ jobs:
         if: matrix.os == 'windows-latest'
         run: cl /std:c++17 src\main.cpp /Fe:ion.exe
 
+      # ========================
+      # Rename outputs
+      # ========================
+
       - name: Rename binaries
         shell: bash
         run: |
           if [ "${{ matrix.os }}" = "macos-latest" ]; then mv ion ion-mac; fi
           if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then mv ion ion-linux; fi
+
+      # ========================
+      # Upload artifacts
+      # ========================
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -53,8 +72,14 @@ jobs:
             ion-mac
             ion-linux
             ion.exe
+          if-no-files-found: ignore
+
+  # ========================
+  # Release job
+  # ========================
 
   release:
+    name: Create Release
     needs: build
     runs-on: ubuntu-latest
 
@@ -62,15 +87,15 @@ jobs:
       - name: Download artifacts
         uses: actions/download-artifact@v4
 
-      - name: Debug files
+      - name: Show files (debug)
         run: ls -R
 
-      - name: Create Release
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            */ion-mac
-            */ion-linux
-            */ion.exe
+            **/ion-mac
+            **/ion-linux
+            **/ion.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
