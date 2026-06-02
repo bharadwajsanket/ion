@@ -45,7 +45,12 @@ If Git sometimes feels like too much, ion is a focused alternative that stays si
 I built ion to understand how version control systems work internally, without the complexity of Git. Over time it became a genuinely useful tool, and v0.4 makes it ready for real projects.
 
 ---
+## Workflow
 
+<img width="2120" height="3180" alt="Ion Diagram" src="https://github.com/user-attachments/assets/f4a511fb-4d83-4968-8a87-2ce5b3d16c81" />
+
+
+---
 ## What's New in v0.4
 
 - **Safe restore and checkout** — both commands refuse to run if unsaved work would be destroyed. No data is ever lost silently.
