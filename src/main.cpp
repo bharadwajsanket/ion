@@ -8,11 +8,12 @@
 #include <unordered_set>
 #include <algorithm>
 #include <ctime>
+#include <cstdint>   // uint64_t for FNV-1a
 #include <iomanip>
 #include <functional>
+#include <optional>
 #include <set>
 #include <map>
-#include <optional>
 
 namespace fs = std::filesystem;
 
@@ -47,7 +48,7 @@ namespace color {
 // FILE I/O HELPERS
 // ============================================================
 
-// Read first line of a file. Returns "" on failure.
+// Read the first line of a file. Returns "" on failure.
 std::string read_file(const std::string& path) {
     std::ifstream in(path);
     if (!in) return "";
@@ -89,7 +90,6 @@ bool write_file(const std::string& path, const std::string& value) {
 bool copy_file_safe(const fs::path& src, const fs::path& dst,
                     fs::copy_options opts = fs::copy_options::overwrite_existing) {
     std::error_code ec;
-    // Only create parent directories if there actually is a parent to create.
     fs::path parent = dst.parent_path();
     if (!parent.empty() && parent != dst) {
         fs::create_directories(parent, ec);
@@ -119,7 +119,6 @@ bool is_valid_repo() {
            fs::exists(ION_OBJECTS);
 }
 
-// Prints an error and returns 1. Used for early-exit in commands.
 int repo_error() {
     std::cerr << color::red
               << "error: not an ion repository. Run 'ion init' first.\n"
@@ -147,16 +146,36 @@ bool set_branch_commit(const std::string& branch, const std::string& commit) {
 }
 
 // ============================================================
-// HASHING
+// HASHING  —  FNV-1a 64-bit
+//
+// Replaces std::hash<std::string> which is:
+//   - implementation-defined (no guarantee of cross-platform consistency)
+//   - 32-bit on 32-bit targets (different hash length, incompatible repos)
+//   - not a stable algorithm across compilers or stdlib versions
+//
+// FNV-1a 64-bit is:
+//   - fully specified and deterministic on every conforming C++ compiler
+//   - always produces 16 hex characters regardless of platform word size
+//   - no external dependencies
 // ============================================================
 
-// Content-hash a file using std::hash. Returns 16-char hex string.
+// Returns a 16-character lowercase hex hash, or "" on I/O error.
+// An empty return must be treated as a fatal error by the caller.
 std::string hash_file(const fs::path& file) {
     std::ifstream in(file, std::ios::binary);
-    if (!in) return "0000000000000000";
-    std::ostringstream buf;
-    buf << in.rdbuf();
-    size_t h = std::hash<std::string>{}(buf.str());
+    if (!in) return "";
+
+    constexpr uint64_t FNV_OFFSET_BASIS = 14695981039346656037ULL;
+    constexpr uint64_t FNV_PRIME        = 1099511628211ULL;
+
+    uint64_t h = FNV_OFFSET_BASIS;
+    char c;
+    while (in.get(c)) {
+        h ^= static_cast<uint8_t>(c);
+        h *= FNV_PRIME;
+    }
+    if (in.bad()) return ""; // distinguish I/O error from clean EOF
+
     std::ostringstream hex;
     hex << std::hex << std::setw(16) << std::setfill('0') << h;
     return hex.str();
@@ -172,13 +191,42 @@ static std::string norm(std::string p) {
 }
 
 // ============================================================
+// INPUT VALIDATION
+//
+// All user-supplied names (branch names, commit IDs) are validated
+// before being concatenated onto filesystem paths.  This prevents
+// path traversal attacks such as:
+//   ion checkout ../../etc/passwd
+//   ion show ../HEAD
+// ============================================================
+
+// Safe branch name: letters, digits, '-', '_', '.'.
+// Must not start with '.' and must not contain '..'.
+bool is_safe_branch_name(const std::string& name) {
+    if (name.empty()) return false;
+    if (name[0] == '.') return false;                          // no hidden / relative
+    if (name.find("..") != std::string::npos) return false;   // no traversal
+    for (char raw : name)
+        if (!std::isalnum(static_cast<unsigned char>(raw)) && raw != '_' && raw != '-' && raw != '.') return false;
+    return true;
+}
+
+// Safe commit ID: non-empty, digits only (ion commit IDs are sequential integers).
+bool is_safe_commit_id(const std::string& id) {
+    if (id.empty()) return false;
+    for (char raw : id)
+        if (!std::isdigit(static_cast<unsigned char>(raw))) return false;
+    return true;
+}
+
+// ============================================================
 // .IONIGNORE
 // ============================================================
 
 struct IgnoreRules {
     std::vector<std::string> extensions;   // e.g. ".log"
     std::vector<std::string> dir_prefixes; // e.g. "build/"
-    std::vector<std::string> filenames;    // exact name or relative path
+    std::vector<std::string> filenames;    // exact relative path or bare filename
 };
 
 static std::string trim_str(const std::string& s) {
@@ -197,7 +245,7 @@ IgnoreRules load_ignore_rules() {
         if (line.size() > 2 && line[0] == '*' && line[1] == '.') {
             rules.extensions.push_back(line.substr(1)); // store as ".log"
         } else if (line.back() == '/') {
-            rules.dir_prefixes.push_back(line); // "build/"
+            rules.dir_prefixes.push_back(line);
         } else {
             rules.filenames.push_back(line);
         }
@@ -228,7 +276,67 @@ bool should_ignore(const std::string& rel_raw, const IgnoreRules& rules) {
 }
 
 // ============================================================
-// COMMIT STRUCT
+// COMMIT SERIALIZATION HELPERS
+//
+// Problem (v0.3): commit messages written verbatim.  A message containing
+// a real newline injects fake header lines into the commit file, making
+// the parser read a forged "parent:" or "files:" entry.
+//
+// Fix: escape before write, unescape after read.
+//   '\' -> '\\'
+//   newline -> '\n'   (two printable characters)
+//   carriage return -> '\r'
+// ============================================================
+
+static std::string escape_message(const std::string& msg) {
+    std::string out;
+    out.reserve(msg.size());
+    for (char c : msg) {
+        if      (c == '\\') { out += "\\\\"; }
+        else if (c == '\n') { out += "\\n";  }
+        else if (c == '\r') { out += "\\r";  }
+        else                { out += c;      }
+    }
+    return out;
+}
+
+static std::string unescape_message(const std::string& raw) {
+    std::string out;
+    out.reserve(raw.size());
+    for (size_t i = 0; i < raw.size(); ++i) {
+        if (raw[i] == '\\' && i + 1 < raw.size()) {
+            ++i;
+            if      (raw[i] == 'n')  { out += '\n'; }
+            else if (raw[i] == 'r')  { out += '\r'; }
+            else if (raw[i] == '\\') { out += '\\'; }
+            else { out += '\\'; out += raw[i]; } // unknown escape — preserve as-is
+        } else {
+            out += raw[i];
+        }
+    }
+    return out;
+}
+
+// ============================================================
+// COMMIT STRUCT + SERIALIZATION
+//
+// Commit file format (v0.4):
+//
+//   id: <id>
+//   parent: <parent>
+//   timestamp: <unix_epoch>
+//   message: <escaped_single_line>
+//   files:
+//   \t<16hexchars> <filename to end of line>
+//
+// The hash field is always exactly 16 lowercase hex characters.
+// A single space separates hash from filename.
+// The filename extends to end-of-line, so filenames with spaces work.
+//
+// Why this format:
+//   v0.3 used "filename hash" separated by whitespace (iss >> f >> h).
+//   Any filename containing a space silently truncated the filename and
+//   discarded the hash, making restore impossible.
 // ============================================================
 
 struct Commit {
@@ -249,6 +357,13 @@ Commit read_commit(const std::string& id) {
     if (!fs::exists(path)) return c;
 
     std::ifstream in(path);
+    if (!in) {
+        // Fail loudly — a commit we can't open is a defect, not an empty record.
+        std::cerr << color::red << "error: cannot open commit " << id
+                  << color::reset << "\n";
+        return c;
+    }
+
     std::string line;
     bool in_files = false;
 
@@ -256,15 +371,19 @@ Commit read_commit(const std::string& id) {
         if (!in_files) {
             if      (line.rfind("id: ", 0) == 0)        c.id        = line.substr(4);
             else if (line.rfind("parent: ", 0) == 0)    c.parent    = line.substr(8);
-            else if (line.rfind("message: ", 0) == 0)   c.message   = line.substr(9);
+            else if (line.rfind("message: ", 0) == 0)   c.message   = unescape_message(line.substr(9));
             else if (line.rfind("timestamp: ", 0) == 0) c.timestamp = line.substr(11);
             else if (line == "files:")                   in_files    = true;
         } else {
-            if (line.empty()) continue;
-            std::istringstream iss(line);
-            std::string f, h;
-            iss >> f >> h;
-            if (!f.empty() && !h.empty()) c.files[f] = h;
+            // File entry: TAB + 16-char-hash + SPACE + filename
+            // Minimum valid length: 1('\t') + 16(hash) + 1(' ') + 1(name) = 19
+            if (line.size() < 19) continue;
+            if (line[0] != '\t') continue;
+            if (line[17] != ' ') continue; // malformed — skip
+            std::string hash     = line.substr(1, 16);
+            std::string filename = line.substr(18); // rest of line, spaces preserved
+            if (!hash.empty() && !filename.empty())
+                c.files[filename] = hash;
         }
     }
     return c;
@@ -273,21 +392,32 @@ Commit read_commit(const std::string& id) {
 bool write_commit(const Commit& c) {
     std::error_code ec;
     fs::create_directories(ION_COMMITS, ec);
+    if (ec) {
+        std::cerr << color::red << "error: cannot create commits directory: "
+                  << ec.message() << color::reset << "\n";
+        return false;
+    }
+
     std::string path = ION_COMMITS + "/" + c.id;
     std::ofstream out(path, std::ios::trunc);
     if (!out) {
-        std::cerr << color::red << "error: cannot write commit " << c.id << color::reset << "\n";
+        std::cerr << color::red << "error: cannot write commit " << c.id
+                  << color::reset << "\n";
         return false;
     }
-    out << "id: "        << c.id        << "\n"
-        << "parent: "    << c.parent    << "\n"
-        << "message: "   << c.message   << "\n"
-        << "timestamp: " << c.timestamp << "\n"
+
+    out << "id: "        << c.id                      << "\n"
+        << "parent: "    << c.parent                  << "\n"
+        << "timestamp: " << c.timestamp               << "\n"
+        << "message: "   << escape_message(c.message) << "\n"
         << "files:\n";
-    // Sort for deterministic output.
+
+    // Sort entries for deterministic output.
     std::vector<std::pair<std::string, std::string>> sorted(c.files.begin(), c.files.end());
     std::sort(sorted.begin(), sorted.end());
-    for (auto& [f, h] : sorted) out << f << " " << h << "\n";
+    for (auto& [f, h] : sorted)
+        out << "\t" << h << " " << f << "\n";
+
     return true;
 }
 
@@ -313,27 +443,51 @@ std::string next_commit_id() {
 // WORKING DIRECTORY SCAN
 // ============================================================
 
-std::unordered_map<std::string, std::string>
+// Returns nullopt and prints an error if the directory cannot be scanned
+// or if any file cannot be read.  The caller MUST treat nullopt as fatal
+// and abort the current command — never assume an empty map on error.
+std::optional<std::unordered_map<std::string, std::string>>
 collect_working_files(const IgnoreRules& rules) {
     std::unordered_map<std::string, std::string> result;
     std::error_code ec;
-    for (const auto& entry : fs::recursive_directory_iterator(
-             ".", fs::directory_options::skip_permission_denied, ec)) {
+
+    // Construct the iterator explicitly so we can check construction failure.
+    auto it = fs::recursive_directory_iterator(
+        ".", fs::directory_options::skip_permission_denied, ec);
+    if (ec) {
+        std::cerr << color::red << "error: cannot scan working directory: "
+                  << ec.message() << color::reset << "\n";
+        return std::nullopt;
+    }
+
+    for (const auto& entry : it) {
         if (!fs::is_regular_file(entry.path())) continue;
         std::string rel = norm(fs::relative(entry.path(), ".").string());
         if (should_ignore(rel, rules)) continue;
-        result[rel] = hash_file(entry.path());
+
+        std::string h = hash_file(entry.path());
+        if (h.empty()) {
+            // hash_file returns "" on any I/O error — this is fatal.
+            std::cerr << color::red << "error: cannot read file: " << rel
+                      << color::reset << "\n";
+            return std::nullopt;
+        }
+        result[rel] = h;
     }
     return result;
 }
 
 // Collect only ignored files (for status --ignored display).
+// Non-fatal: if the scan fails, returns an empty list — it's display-only.
 std::vector<std::string>
 collect_ignored_files(const IgnoreRules& rules) {
     std::vector<std::string> result;
     std::error_code ec;
-    for (const auto& entry : fs::recursive_directory_iterator(
-             ".", fs::directory_options::skip_permission_denied, ec)) {
+    auto it = fs::recursive_directory_iterator(
+        ".", fs::directory_options::skip_permission_denied, ec);
+    if (ec) return result;
+
+    for (const auto& entry : it) {
         if (!fs::is_regular_file(entry.path())) continue;
         std::string rel = norm(fs::relative(entry.path(), ".").string());
         if (rel.rfind(".ion/", 0) == 0 || rel == ".ion") continue;
@@ -344,19 +498,64 @@ collect_ignored_files(const IgnoreRules& rules) {
 }
 
 // ============================================================
+// SAFE RESTORE — PRE-FLIGHT CHECK
+//
+// Before any destructive restore, determine which working-directory files
+// would be permanently lost.
+//
+// A file is "at risk" when ALL of the following are true:
+//   1. It exists in the working directory.
+//   2. Its current content differs from what the current HEAD commit has
+//      (i.e. it has unsaved local changes, OR it is untracked).
+//   3. The target commit does NOT restore it to its exact current content.
+//
+// If the at-risk list is non-empty the caller must abort — ion never
+// silently destroys work the user has not saved.
+// ============================================================
+
+std::vector<std::string> files_at_risk(
+    const std::unordered_map<std::string, std::string>& working,
+    const std::unordered_map<std::string, std::string>& head_committed,
+    const std::unordered_map<std::string, std::string>& target_committed)
+{
+    std::vector<std::string> at_risk;
+    for (auto& [f, wh] : working) {
+        // Does the working copy exactly match HEAD? If yes, it's clean.
+        auto hit = head_committed.find(f);
+        bool matches_head = (hit != head_committed.end() && hit->second == wh);
+        if (matches_head) continue;
+
+        // File has unsaved content.  Will the restore preserve it exactly?
+        auto tit = target_committed.find(f);
+        bool preserved = (tit != target_committed.end() && tit->second == wh);
+        if (!preserved) at_risk.push_back(f);
+    }
+    std::sort(at_risk.begin(), at_risk.end());
+    return at_risk;
+}
+
+// ============================================================
 // RESTORE WORKING DIRECTORY
 // ============================================================
 
 bool restore_commit(const std::string& id, const IgnoreRules& rules) {
-    // Remove all non-ignored, non-.ion files.
+    // Phase 1: collect the list of files to remove.
     std::vector<fs::path> to_remove;
     std::error_code ec;
-    for (const auto& entry : fs::recursive_directory_iterator(
-             ".", fs::directory_options::skip_permission_denied, ec)) {
+    auto it = fs::recursive_directory_iterator(
+        ".", fs::directory_options::skip_permission_denied, ec);
+    if (ec) {
+        std::cerr << color::red << "error: cannot scan working directory: "
+                  << ec.message() << color::reset << "\n";
+        return false;
+    }
+    for (const auto& entry : it) {
         if (!fs::is_regular_file(entry.path())) continue;
         std::string rel = norm(fs::relative(entry.path(), ".").string());
         if (!should_ignore(rel, rules)) to_remove.push_back(entry.path());
     }
+
+    // Phase 2: remove them.
     for (auto& p : to_remove) {
         fs::remove(p, ec);
         if (ec) {
@@ -368,6 +567,7 @@ bool restore_commit(const std::string& id, const IgnoreRules& rules) {
 
     if (id == "null" || id.empty()) return true;
 
+    // Phase 3: restore files from the target commit.
     Commit c = read_commit(id);
     bool ok  = true;
     for (auto& [file, hash] : c.files) {
@@ -392,6 +592,7 @@ std::string format_timestamp(const std::string& ts_str) {
     try {
         time_t ts = static_cast<time_t>(std::stoll(ts_str));
         std::tm* t = std::localtime(&ts);
+        if (!t) return ts_str; // null-guard: localtime returns nullptr for out-of-range values
         char buf[32];
         std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", t);
         return buf;
@@ -404,7 +605,7 @@ std::string format_timestamp(const std::string& ts_str) {
 
 struct DiffLine { char op; std::string text; }; // op: ' ', '+', '-'
 
-// LCS-based line diff.
+// LCS-based unified line diff.
 std::vector<DiffLine> compute_diff(const std::vector<std::string>& old_lines,
                                    const std::vector<std::string>& new_lines) {
     size_t n = old_lines.size(), m = new_lines.size();
@@ -449,15 +650,15 @@ void print_file_diff(const std::string& filename,
 
     std::cout << color::bold << color::cyan << "diff " << filename << color::reset << "\n";
 
-    // Group changes into hunks with context.
     std::vector<size_t> changed;
     for (size_t k = 0; k < diff.size(); ++k)
         if (diff[k].op != ' ') changed.push_back(k);
 
     std::vector<std::pair<size_t, size_t>> ranges;
     for (size_t ci : changed) {
-        size_t lo = (ci >= (size_t)context) ? ci - context : 0;
-        size_t hi = std::min(ci + context + 1, diff.size());
+        size_t ctx = static_cast<size_t>(context);
+        size_t lo = (ci >= ctx) ? ci - ctx : 0;
+        size_t hi = std::min(ci + ctx + 1, diff.size());
         if (!ranges.empty() && lo <= ranges.back().second)
             ranges.back().second = hi;
         else
@@ -559,15 +760,30 @@ int cmd_init() {
         std::cout << color::yellow << "Repository already exists.\n" << color::reset;
         return 0;
     }
+
+    // Check each directory creation independently — a shared error_code variable
+    // would be silently reset to success by a later successful call.
     std::error_code ec;
-    fs::create_directories(ION_COMMITS,  ec);
-    fs::create_directories(ION_OBJECTS,  ec);
-    fs::create_directories(ION_BRANCHES, ec);
+
+    fs::create_directories(ION_COMMITS, ec);
     if (ec) {
-        std::cerr << color::red << "error: failed to create repository structure: "
+        std::cerr << color::red << "error: failed to create commits directory: "
                   << ec.message() << color::reset << "\n";
         return 1;
     }
+    fs::create_directories(ION_OBJECTS, ec);
+    if (ec) {
+        std::cerr << color::red << "error: failed to create objects directory: "
+                  << ec.message() << color::reset << "\n";
+        return 1;
+    }
+    fs::create_directories(ION_BRANCHES, ec);
+    if (ec) {
+        std::cerr << color::red << "error: failed to create branches directory: "
+                  << ec.message() << color::reset << "\n";
+        return 1;
+    }
+
     if (!write_file(ION_HEAD,               "main")) return 1;
     if (!write_file(ION_BRANCHES + "/main", "null")) return 1;
 
@@ -600,9 +816,11 @@ int cmd_status(bool show_ignored = false) {
     std::unordered_map<std::string, std::string> committed;
     if (head_commit != "null") committed = read_commit(head_commit).files;
 
-    auto working      = collect_working_files(rules);
-    auto ignored_list = show_ignored ? collect_ignored_files(rules) : std::vector<std::string>{};
+    auto working_opt = collect_working_files(rules);
+    if (!working_opt) return 1;
+    auto& working = *working_opt;
 
+    auto ignored_list = show_ignored ? collect_ignored_files(rules) : std::vector<std::string>{};
     auto s = compute_status(committed, working, ignored_list);
 
     if (!has_changes(s) && (!show_ignored || s.ignored.empty())) {
@@ -655,7 +873,12 @@ int cmd_diff(const std::string& target_file = "") {
     std::unordered_map<std::string, std::string> committed;
     if (head_commit != "null") committed = read_commit(head_commit).files;
 
-    auto working = collect_working_files(rules);
+    auto working_opt = collect_working_files(rules);
+    if (!working_opt) return 1;
+    auto& working = *working_opt;
+
+    // Normalize the target path for comparison so "ion diff ./foo.txt" works.
+    std::string norm_target = norm(target_file);
 
     std::set<std::string> all_files;
     for (auto& [f, _] : working)   all_files.insert(f);
@@ -664,7 +887,7 @@ int cmd_diff(const std::string& target_file = "") {
     bool any_diff = false;
 
     for (auto& file : all_files) {
-        if (!target_file.empty() && file != target_file) continue;
+        if (!norm_target.empty() && norm(file) != norm_target) continue;
 
         std::string old_hash = "null", new_hash = "null";
         auto ci = committed.find(file); if (ci != committed.end()) old_hash = ci->second;
@@ -696,9 +919,14 @@ int cmd_diff(const std::string& target_file = "") {
 
 // ============================================================
 // CMD: SAVE
+//
+// v0.4 change: the --confirm interactive prompt has been removed.
+// ion's philosophy requires no hidden interaction — the user issues
+// a command and it executes.  Confirmation is the user's responsibility
+// before running the command (e.g. run 'ion status' first).
 // ============================================================
 
-int cmd_save(const std::string& message, bool confirm) {
+int cmd_save(const std::string& message) {
     if (!is_valid_repo()) return repo_error();
     if (message.empty()) {
         std::cerr << color::red << "error: save message cannot be empty\n" << color::reset;
@@ -712,8 +940,11 @@ int cmd_save(const std::string& message, bool confirm) {
     std::unordered_map<std::string, std::string> committed;
     if (parent != "null") committed = read_commit(parent).files;
 
-    auto working = collect_working_files(rules);
-    auto s       = compute_status(committed, working, {});
+    auto working_opt = collect_working_files(rules);
+    if (!working_opt) return 1;
+    auto& working = *working_opt;
+
+    auto s = compute_status(committed, working, {});
 
     if (!has_changes(s)) {
         std::cout << color::yellow
@@ -726,19 +957,14 @@ int cmd_save(const std::string& message, bool confirm) {
     print_change_summary(s);
     std::cout << "\n";
 
-    if (confirm) {
-        std::cout << "Proceed with save? [y/N] ";
-        std::string resp;
-        std::getline(std::cin, resp);
-        if (resp != "y" && resp != "Y") {
-            std::cout << color::gray << "Save aborted.\n" << color::reset;
-            return 0;
-        }
-    }
-
     // Store content objects.
     std::error_code ec;
     fs::create_directories(ION_OBJECTS, ec);
+    if (ec) {
+        std::cerr << color::red << "error: cannot create objects directory: "
+                  << ec.message() << color::reset << "\n";
+        return 1;
+    }
     for (auto& [rel, hash] : working) {
         fs::path obj = ION_OBJECTS + "/" + hash;
         if (!fs::exists(obj))
@@ -769,12 +995,11 @@ int cmd_save(const std::string& message, bool confirm) {
 
 int cmd_branch(const std::string& name) {
     if (!is_valid_repo()) return repo_error();
-    if (name.empty()) {
-        std::cerr << color::red << "error: branch name cannot be empty\n" << color::reset;
-        return 1;
-    }
-    if (name.find('/') != std::string::npos || name.find('\\') != std::string::npos) {
-        std::cerr << color::red << "error: branch name may not contain path separators\n"
+    if (!is_safe_branch_name(name)) {
+        std::cerr << color::red
+                  << "error: invalid branch name '" << name << "'\n"
+                  << "  Allowed: letters, digits, '-', '_', '.'\n"
+                  << "  Must not start with '.' or contain '..'\n"
                   << color::reset;
         return 1;
     }
@@ -798,6 +1023,47 @@ int cmd_branch(const std::string& name) {
 }
 
 // ============================================================
+// CMD: BRANCH-DELETE
+// ============================================================
+
+int cmd_branch_delete(const std::string& name) {
+    if (!is_valid_repo()) return repo_error();
+    if (!is_safe_branch_name(name)) {
+        std::cerr << color::red << "error: invalid branch name '" << name << "'\n"
+                  << color::reset;
+        return 1;
+    }
+
+    std::string current = get_current_branch();
+    if (name == current) {
+        std::cerr << color::red
+                  << "error: cannot delete the currently active branch '" << name << "'\n"
+                  << color::gray << "  Switch to another branch first: ion switch <branch>\n"
+                  << color::reset;
+        return 1;
+    }
+
+    fs::path path = ION_BRANCHES + "/" + name;
+    if (!fs::exists(path)) {
+        std::cerr << color::red << "error: branch '" << name << "' not found\n"
+                  << color::reset;
+        return 1;
+    }
+
+    std::error_code ec;
+    fs::remove(path, ec);
+    if (ec) {
+        std::cerr << color::red << "error: cannot delete branch '" << name
+                  << "': " << ec.message() << color::reset << "\n";
+        return 1;
+    }
+
+    std::cout << color::green << "Deleted branch " << color::bold << name << color::reset << "\n";
+    std::cout << color::gray << "  Commits and objects are preserved.\n" << color::reset;
+    return 0;
+}
+
+// ============================================================
 // CMD: BRANCHES (LIST)
 // ============================================================
 
@@ -809,6 +1075,11 @@ int cmd_branches() {
     std::error_code ec;
     for (auto& entry : fs::directory_iterator(ION_BRANCHES, ec))
         names.push_back(entry.path().filename().string());
+    if (ec) {
+        std::cerr << color::red << "error: cannot read branches directory: "
+                  << ec.message() << color::reset << "\n";
+        return 1;
+    }
     std::sort(names.begin(), names.end());
 
     for (auto& name : names) {
@@ -837,11 +1108,22 @@ int cmd_branches() {
 }
 
 // ============================================================
-// CMD: CHECKOUT
+// CMD: CHECKOUT  (also dispatched by 'switch' alias)
+//
+// v0.4 change: the interactive "Continue anyway? [y/N]" prompt is removed.
+// If checkout would destroy unsaved work, the command fails with a clear
+// error listing every at-risk file.  The user must save or resolve first.
 // ============================================================
 
 int cmd_checkout(const std::string& name) {
     if (!is_valid_repo()) return repo_error();
+    if (!is_safe_branch_name(name)) {
+        std::cerr << color::red
+                  << "error: invalid branch name '" << name << "'\n"
+                  << "  Allowed: letters, digits, '-', '_', '.'\n"
+                  << color::reset;
+        return 1;
+    }
 
     fs::path path = ION_BRANCHES + "/" + name;
     if (!fs::exists(path)) {
@@ -858,31 +1140,34 @@ int cmd_checkout(const std::string& name) {
 
     IgnoreRules rules = load_ignore_rules();
 
-    // Detect unsaved changes.
-    std::string head_commit = get_branch_commit(current);
-    std::unordered_map<std::string, std::string> committed;
-    if (head_commit != "null") committed = read_commit(head_commit).files;
-    auto working = collect_working_files(rules);
-    auto s       = compute_status(committed, working, {});
+    // Resolve all three states needed for the pre-flight check.
+    std::string head_id = get_branch_commit(current);
+    std::unordered_map<std::string, std::string> head_committed;
+    if (head_id != "null") head_committed = read_commit(head_id).files;
 
-    if (has_changes(s)) {
-        std::cout << color::yellow
-                  << "warning: " << change_stats(s) << " on branch '" << current << "'.\n"
-                  << "  These will be lost if you switch now.\n"
-                  << "  Save first with: ion save \"...\"\n\n"
-                  << "  Continue anyway? [y/N] " << color::reset;
-        std::string resp;
-        std::getline(std::cin, resp);
-        if (resp != "y" && resp != "Y") {
-            std::cout << color::gray << "Checkout aborted.\n" << color::reset;
-            return 0;
-        }
+    std::string target_id = read_file(path.string());
+    if (target_id.empty()) target_id = "null";
+    std::unordered_map<std::string, std::string> target_committed;
+    if (target_id != "null") target_committed = read_commit(target_id).files;
+
+    auto working_opt = collect_working_files(rules);
+    if (!working_opt) return 1;
+    auto& working = *working_opt;
+
+    // Hard error — no prompt.
+    auto at_risk = files_at_risk(working, head_committed, target_committed);
+    if (!at_risk.empty()) {
+        std::cerr << color::red
+                  << "error: checkout would destroy unsaved work:\n" << color::reset;
+        for (auto& f : at_risk)
+            std::cerr << "  " << color::yellow << f << color::reset << "\n";
+        std::cerr << color::gray
+                  << "Save your changes first: ion save \"...\"\n"
+                  << color::reset;
+        return 1;
     }
 
-    std::string target_commit = read_file(path.string());
-    if (target_commit.empty()) target_commit = "null";
-
-    if (!restore_commit(target_commit, rules)) {
+    if (!restore_commit(target_id, rules)) {
         std::cerr << color::red
                   << "error: checkout failed — repository may be in a partial state\n"
                   << color::reset;
@@ -890,11 +1175,12 @@ int cmd_checkout(const std::string& name) {
     }
     if (!write_file(ION_HEAD, name)) return 1;
 
-    std::cout << color::green << "Switched to branch " << color::bold << name << color::reset << "\n";
-    if (target_commit == "null")
+    std::cout << color::green << "Switched to branch " << color::bold << name
+              << color::reset << "\n";
+    if (target_id == "null")
         std::cout << color::gray << "  (empty branch — no files restored)\n" << color::reset;
     else
-        std::cout << color::gray << "  at commit " << target_commit << color::reset << "\n";
+        std::cout << color::gray << "  at commit " << target_id << color::reset << "\n";
     return 0;
 }
 
@@ -956,13 +1242,18 @@ int cmd_history(bool oneline = false) {
 
 int cmd_show(const std::string& id, bool with_diff = false) {
     if (!is_valid_repo()) return repo_error();
+    if (!is_safe_commit_id(id)) {
+        std::cerr << color::red << "error: invalid commit id '" << id
+                  << "' — commit ids must be numeric\n" << color::reset;
+        return 1;
+    }
 
     if (!fs::exists(ION_COMMITS + "/" + id)) {
         std::cerr << color::red << "error: commit " << id << " not found\n" << color::reset;
         return 1;
     }
 
-    Commit c       = read_commit(id);
+    Commit c            = read_commit(id);
     std::string branch  = get_current_branch();
     std::string head_id = get_branch_commit(branch);
 
@@ -971,7 +1262,6 @@ int cmd_show(const std::string& id, bool with_diff = false) {
     std::cout << color::gray << "  files:   " << c.files.size() << " tracked\n" << color::reset;
     print_separator();
 
-    // Compute what changed vs parent.
     std::unordered_map<std::string, std::string> parent_files;
     if (c.parent != "null") parent_files = read_commit(c.parent).files;
 
@@ -996,7 +1286,6 @@ int cmd_show(const std::string& id, bool with_diff = false) {
         for (auto& f : del) std::cout << "  " << color::red    << "- " << f << color::reset << "\n";
     }
 
-    // Optional inline diff from stored objects.
     if (with_diff && !(add.empty() && mod.empty() && del.empty())) {
         std::cout << "\n";
         print_separator();
@@ -1036,10 +1325,19 @@ int cmd_show(const std::string& id, bool with_diff = false) {
 
 // ============================================================
 // CMD: RESTORE (JUMP TO COMMIT)
+//
+// v0.4 change: the interactive "Continue? [y/N]" prompt is removed.
+// The pre-flight check aborts with a hard error if any unsaved work
+// would be destroyed.  No data is ever modified before the check.
 // ============================================================
 
 int cmd_restore(const std::string& id) {
     if (!is_valid_repo()) return repo_error();
+    if (!is_safe_commit_id(id)) {
+        std::cerr << color::red << "error: invalid commit id '" << id
+                  << "' — commit ids must be numeric\n" << color::reset;
+        return 1;
+    }
 
     if (!fs::exists(ION_COMMITS + "/" + id)) {
         std::cerr << color::red << "error: commit " << id << " not found\n" << color::reset;
@@ -1048,15 +1346,30 @@ int cmd_restore(const std::string& id) {
 
     IgnoreRules rules = load_ignore_rules();
 
-    std::cout << color::yellow
-              << "warning: this will overwrite your working directory with commit " << id << ".\n"
-              << "  Your HEAD pointer will not change.\n"
-              << "  Continue? [y/N] " << color::reset;
-    std::string resp;
-    std::getline(std::cin, resp);
-    if (resp != "y" && resp != "Y") {
-        std::cout << color::gray << "Restore aborted.\n" << color::reset;
-        return 0;
+    // Build the three states needed for the pre-flight check.
+    std::string branch  = get_current_branch();
+    std::string head_id = get_branch_commit(branch);
+
+    std::unordered_map<std::string, std::string> head_committed;
+    if (head_id != "null") head_committed = read_commit(head_id).files;
+
+    std::unordered_map<std::string, std::string> target_committed = read_commit(id).files;
+
+    auto working_opt = collect_working_files(rules);
+    if (!working_opt) return 1;
+    auto& working = *working_opt;
+
+    // Abort before touching anything if work would be lost — no prompt.
+    auto at_risk = files_at_risk(working, head_committed, target_committed);
+    if (!at_risk.empty()) {
+        std::cerr << color::red << "error: restore would destroy unsaved work:\n"
+                  << color::reset;
+        for (auto& f : at_risk)
+            std::cerr << "  " << color::yellow << f << color::reset << "\n";
+        std::cerr << color::gray
+                  << "Save your changes first: ion save \"...\"\n"
+                  << color::reset;
+        return 1;
     }
 
     if (!restore_commit(id, rules)) {
@@ -1066,9 +1379,99 @@ int cmd_restore(const std::string& id) {
 
     std::cout << color::green << "Restored commit " << id << "\n" << color::reset;
     std::cout << color::gray
+              << "  HEAD remains on branch " << branch << " at commit " << head_id << ".\n"
               << "  Tip: run 'ion save \"...\"' to create a new commit from this state.\n"
               << color::reset;
     return 0;
+}
+
+// ============================================================
+// CMD: VERIFY  (read-only integrity check)
+// ============================================================
+
+int cmd_verify() {
+    if (!is_valid_repo()) return repo_error();
+
+    bool ok = true;
+    int  defect_count = 0;
+
+    auto defect = [&](const std::string& msg) {
+        std::cerr << color::red << "defect: " << msg << color::reset << "\n";
+        ok = false;
+        ++defect_count;
+    };
+
+    // 1. Verify HEAD points to a real branch.
+    std::string branch = get_current_branch();
+    if (branch.empty()) {
+        defect("HEAD is empty");
+    } else if (!fs::exists(ION_BRANCHES + "/" + branch)) {
+        defect("HEAD points to missing branch '" + branch + "'");
+    }
+
+    // 2. Enumerate all branches.
+    std::vector<std::string> branches;
+    std::error_code ec;
+    for (auto& e : fs::directory_iterator(ION_BRANCHES, ec))
+        branches.push_back(e.path().filename().string());
+    if (ec) { defect("cannot read branches directory"); return 1; }
+    std::sort(branches.begin(), branches.end());
+
+    // 3. Walk every commit chain reachable from any branch.
+    std::unordered_set<std::string> visited;
+    int commit_count = 0;
+
+    for (auto& br : branches) {
+        std::string cid = get_branch_commit(br);
+        int depth = 0;
+
+        while (cid != "null" && !cid.empty()) {
+            if (visited.count(cid)) break; // already validated — skip shared history
+            visited.insert(cid);
+            ++commit_count;
+
+            if (!fs::exists(ION_COMMITS + "/" + cid)) {
+                defect("branch '" + br + "' references missing commit " + cid);
+                break;
+            }
+
+            Commit c = read_commit(cid);
+            if (c.id.empty()) {
+                defect("commit " + cid + " is malformed or unreadable");
+                break;
+            }
+
+            // 4. Verify every file object referenced by this commit.
+            for (auto& [f, h] : c.files) {
+                if (!fs::exists(ION_OBJECTS + "/" + h))
+                    defect("commit " + cid + ": missing object " + h + " ('" + f + "')");
+            }
+
+            cid = c.parent;
+            if (++depth > 1000000) {
+                defect("commit chain cycle or runaway detected near commit " + cid);
+                break;
+            }
+        }
+    }
+
+    // Summary.
+    std::cout << "\n";
+    print_separator();
+    if (ok) {
+        std::cout << color::green << color::bold << "Repository OK\n" << color::reset;
+    } else {
+        std::cout << color::red << color::bold
+                  << "Repository has " << defect_count << " defect(s)\n"
+                  << color::reset;
+    }
+    std::cout << color::gray
+              << "  branches: " << branches.size() << "\n"
+              << "  commits:  " << commit_count    << "\n"
+              << color::reset;
+    print_separator();
+
+    return ok ? 0 : 1;
 }
 
 // ============================================================
@@ -1079,35 +1482,37 @@ void print_help() {
     std::cout << color::bold << "ion  —  a local-first version control system\n\n" << color::reset;
 
     auto row = [](const std::string& cmd, const std::string& desc) {
-        std::cout << "  " << color::cyan << std::left << std::setw(38) << cmd
+        std::cout << "  " << color::cyan << std::left << std::setw(40) << cmd
                   << color::reset << desc << "\n";
     };
 
     std::cout << color::bold << "Repository:\n" << color::reset;
-    row("ion init",                         "Initialize a new repository");
+    row("ion init",                           "Initialize a new repository");
+    row("ion verify",                         "Check repository integrity (read-only)");
 
     std::cout << color::bold << "\nSnapshots:\n" << color::reset;
-    row("ion save <message>",               "Save a snapshot");
-    row("ion save <message> --confirm",     "Save with confirmation prompt");
-    row("ion restore <commit>",             "Restore working directory to a commit");
+    row("ion save <message>",                 "Save a snapshot of the working directory");
+    row("ion restore <commit>",               "Restore working directory to a commit");
 
     std::cout << color::bold << "\nInspection:\n" << color::reset;
-    row("ion status",                       "Show working directory status");
-    row("ion status --ignored",             "Also list ignored files");
-    row("ion diff",                         "Show line-level changes vs last commit");
-    row("ion diff <file>",                  "Diff a specific file");
-    row("ion history",                      "Full commit history for current branch");
-    row("ion log --oneline",                "Compact one-line history");
-    row("ion show <commit>",                "Show commit details and file list");
-    row("ion show <commit> --diff",         "Show commit details with inline diff");
+    row("ion status",                         "Show working directory status");
+    row("ion status --ignored",               "Also list ignored files");
+    row("ion diff",                           "Show line-level changes vs last commit");
+    row("ion diff <file>",                    "Diff a specific file");
+    row("ion history",                        "Full commit history for current branch");
+    row("ion log --oneline",                  "Compact one-line history");
+    row("ion show <commit>",                  "Show commit details and file list");
+    row("ion show <commit> --diff",           "Show commit details with inline diff");
 
     std::cout << color::bold << "\nBranches:\n" << color::reset;
-    row("ion branch <name>",                "Create a new branch");
-    row("ion branches",                     "List all branches");
-    row("ion checkout <branch>",            "Switch to a branch");
+    row("ion branch <name>",                  "Create a new branch");
+    row("ion branches",                       "List all branches");
+    row("ion checkout <branch>",              "Switch to a branch");
+    row("ion switch <branch>",                "Alias for checkout");
+    row("ion branch-delete <name>",           "Delete a branch (commits are kept)");
 
     std::cout << "\n" << color::gray
-              << "Ignore rules: create a .ionignore file\n"
+              << "Ignore rules: create a .ionignore file in the project root\n"
               << "  Patterns:  build/   *.log   secret.txt\n"
               << color::reset;
 }
@@ -1121,7 +1526,7 @@ int main(int argc, char* argv[]) {
 
     std::string cmd = argv[1];
 
-    // Parse positional args and --flags separately.
+    // Split remaining argv into positional args and --flag tokens.
     std::vector<std::string> args;
     std::unordered_set<std::string> flags;
     for (int i = 2; i < argc; ++i) {
@@ -1130,8 +1535,8 @@ int main(int argc, char* argv[]) {
         else args.push_back(a);
     }
 
-    auto arg = [&](int idx) -> std::string {
-        return (idx < (int)args.size()) ? args[idx] : "";
+    auto arg      = [&](int idx) -> std::string {
+        return (static_cast<size_t>(idx) < args.size()) ? args[static_cast<size_t>(idx)] : "";
     };
     auto has_flag = [&](const std::string& f) { return flags.count(f) > 0; };
 
@@ -1140,12 +1545,10 @@ int main(int argc, char* argv[]) {
 
     } else if (cmd == "save") {
         if (args.empty()) {
-            std::cerr << color::red
-                      << "error: usage: ion save <message> [--confirm]\n"
-                      << color::reset;
+            std::cerr << color::red << "error: usage: ion save <message>\n" << color::reset;
             return 1;
         }
-        return cmd_save(arg(0), has_flag("--confirm"));
+        return cmd_save(arg(0));
 
     } else if (cmd == "status") {
         return cmd_status(has_flag("--ignored"));
@@ -1158,42 +1561,44 @@ int main(int argc, char* argv[]) {
 
     } else if (cmd == "show") {
         if (args.empty()) {
-            std::cerr << color::red
-                      << "error: usage: ion show <commit> [--diff]\n"
-                      << color::reset;
+            std::cerr << color::red << "error: usage: ion show <commit> [--diff]\n" << color::reset;
             return 1;
         }
         return cmd_show(arg(0), has_flag("--diff"));
 
     } else if (cmd == "branch") {
         if (args.empty()) {
-            std::cerr << color::red
-                      << "error: usage: ion branch <name>\n"
-                      << color::reset;
+            std::cerr << color::red << "error: usage: ion branch <name>\n" << color::reset;
             return 1;
         }
         return cmd_branch(arg(0));
 
+    } else if (cmd == "branch-delete") {
+        if (args.empty()) {
+            std::cerr << color::red << "error: usage: ion branch-delete <name>\n" << color::reset;
+            return 1;
+        }
+        return cmd_branch_delete(arg(0));
+
     } else if (cmd == "branches") {
         return cmd_branches();
 
-    } else if (cmd == "checkout") {
+    } else if (cmd == "checkout" || cmd == "switch") {
         if (args.empty()) {
-            std::cerr << color::red
-                      << "error: usage: ion checkout <branch>\n"
-                      << color::reset;
+            std::cerr << color::red << "error: usage: ion " << cmd << " <branch>\n" << color::reset;
             return 1;
         }
         return cmd_checkout(arg(0));
 
     } else if (cmd == "restore") {
         if (args.empty()) {
-            std::cerr << color::red
-                      << "error: usage: ion restore <commit>\n"
-                      << color::reset;
+            std::cerr << color::red << "error: usage: ion restore <commit>\n" << color::reset;
             return 1;
         }
         return cmd_restore(arg(0));
+
+    } else if (cmd == "verify") {
+        return cmd_verify();
 
     } else if (cmd == "help" || cmd == "--help" || cmd == "-h") {
         print_help();

@@ -1,5 +1,18 @@
+# Build outputs
 ion
-.ion/
-build/
+ion_test
+ion_v04
 *.o
 *.out
+*.exe
+*.dSYM/
+
+# macOS
+.DS_Store
+
+# Editor directories
+.vscode/
+.idea/
+
+# Test directories
+/tmp/
